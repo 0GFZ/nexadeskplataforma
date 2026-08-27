@@ -1,58 +1,57 @@
 name: CI-CD NexaDesk
+
 on:
   push:
     branches: [develop, main]
-permissions:
-  contents: read
-  packages: write
+  workflow_dispatch:
+
+permissions: {contents: read, packages: write}
+
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/nexadesk
+  IMAGE: ghcr.io/0gfz/nexadeskplataforma
+
 jobs:
-  build-test-artifact:
+  pipeline:
+    name: Teste, build e entrega
+    environment:
+      name: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: {node-version: 20}
-      - run: node --check src/app.js
-      - run: |
-          node src/app.js & PID=$!
+
+      - name: Testar aplicação
+        run: |
+          node --check src/app.js
+          MODE=api node src/app.js & PID=$!
+          trap "kill $PID" EXIT
           sleep 2
-          curl -f http://localhost:3000/health
-          kill $PID
-      - uses: docker/login-action@v3
+          curl --fail http://localhost:3000/health
+
+      - name: Login no GHCR
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - run: |
-          docker build -t $IMAGE:${{ github.sha }} .
-          docker push $IMAGE:${{ github.sha }}
-          mkdir artifact
-          sed "s|nexadesk/app:staging|$IMAGE:${{ github.sha }}|" environments/staging/deploy.yaml > artifact/staging.yaml
-          sed "s|nexadesk/app:v1.0.0|$IMAGE:${{ github.sha }}|" environments/prod/deploy.yaml > artifact/prod.yaml
+
+      - name: Build, push e manifesto
+        run: |
+          TAG=staging
+          MANIFEST=environments/staging/deploy.yaml
+          if [ "$GITHUB_REF_NAME" = "main" ]; then
+            TAG=production
+            MANIFEST=environments/prod/deploy.yaml
+          fi
+          docker build -t "$IMAGE:$GITHUB_SHA" -t "$IMAGE:$TAG" .
+          docker push "$IMAGE:$GITHUB_SHA"
+          docker push "$IMAGE:$TAG"
+          mkdir artefato
+          sed -E "s|image: nexadesk/app:[^[:space:]]+|image: $IMAGE:$GITHUB_SHA|g" \
+            "$MANIFEST" > artefato/deploy.yaml
+
       - uses: actions/upload-artifact@v4
-        with: {name: manifests, path: artifact/}
-  staging:
-    needs: build-test-artifact
-    if: github.ref == 'refs/heads/develop'
-    environment: staging
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: |
-          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > kubeconfig
-          export KUBECONFIG=$PWD/kubeconfig
-          kubectl apply -f k8s/observability.yaml
-          sed "s|nexadesk/app:staging|$IMAGE:${{ github.sha }}|" environments/staging/deploy.yaml | kubectl apply -f -
-  production:
-    needs: build-test-artifact
-    if: github.ref == 'refs/heads/main'
-    environment: production
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: |
-          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > kubeconfig
-          export KUBECONFIG=$PWD/kubeconfig
-          sed "s|nexadesk/app:v1.0.0|$IMAGE:${{ github.sha }}|" environments/prod/deploy.yaml | kubectl apply -f -
+        with:
+          name: manifesto-${{ github.ref_name }}
+          path: artefato/
